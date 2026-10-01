@@ -138,6 +138,64 @@ class GipIntegrationTest(unittest.TestCase):
                     self.assertNotEqual(archive.read(name), b"OUTSIDE LEAK\n")
                     self.assertNotEqual(archive.read(name), b"OLD ARCHIVE")
 
+    def test_archives_non_repository_tree_with_recursive_gitignore_and_child_repos(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "workspace"
+            workspace.mkdir()
+
+            (workspace / ".gitignore").write_text("*.rootignore\nignored-dir/\n")
+            (workspace / "keep.txt").write_text("keep\n")
+            (workspace / "drop.rootignore").write_text("ignore\n")
+            ignored_dir = workspace / "ignored-dir"
+            ignored_dir.mkdir()
+            (ignored_dir / "hidden.txt").write_text("ignore\n")
+
+            plain = workspace / "plain"
+            plain.mkdir()
+            (plain / ".gitignore").write_text("secret*\n!secret-keep\n")
+            (plain / "keep.txt").write_text("keep\n")
+            (plain / "secret.txt").write_text("ignore\n")
+            (plain / "secret-keep").write_text("keep\n")
+
+            repo = workspace / "repo"
+            repo.mkdir()
+            self.run_command(repo, "git", "init", "-q")
+            self.run_command(repo, "git", "config", "user.email", "test@example.com")
+            self.run_command(repo, "git", "config", "user.name", "Test")
+            (repo / ".gitignore").write_text("*.log\n")
+            (repo / "tracked.log").write_text("tracked despite ignore\n")
+            (repo / "ignored.log").write_text("ignore\n")
+            (repo / "keep.txt").write_text("keep\n")
+            self.run_command(repo, "git", "add", ".gitignore", "keep.txt")
+            self.run_command(repo, "git", "add", "-f", "tracked.log")
+            self.run_command(repo, "git", "commit", "-qm", "fixture")
+
+            nested_repo = repo / "nested-repo"
+            nested_repo.mkdir()
+            self.run_command(nested_repo, "git", "init", "-q")
+            (nested_repo / ".gitignore").write_text("*.tmp\n")
+            (nested_repo / "keep.txt").write_text("keep\n")
+            (nested_repo / "drop.tmp").write_text("ignore\n")
+
+            output = workspace / "workspace.zip"
+            result = self.run_command(workspace, sys.executable, str(GIP), str(output))
+
+            expected = {
+                ".gitignore",
+                "keep.txt",
+                "plain/.gitignore",
+                "plain/keep.txt",
+                "plain/secret-keep",
+                "repo/.gitignore",
+                "repo/keep.txt",
+                "repo/tracked.log",
+                "repo/nested-repo/.gitignore",
+                "repo/nested-repo/keep.txt",
+            }
+            self.assertIn(f"({len(expected)} files)", result.stdout)
+            with zipfile.ZipFile(output) as archive:
+                self.assertEqual(set(archive.namelist()), expected)
+
     @staticmethod
     def run_command(cwd, *command):
         return subprocess.run(

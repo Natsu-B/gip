@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Zip the Git-visible contents of the current working tree."""
+"""Zip files visible through Git ignore rules."""
 
 import argparse
 import os
@@ -31,9 +31,32 @@ def git_output(*args, cwd=None):
         raise GipError(message) from error
 
 
-def repository_root():
-    output = git_output("rev-parse", "--show-toplevel")
-    return Path(os.fsdecode(output[:-1] if output.endswith(b"\n") else output))
+def find_repository_root(cwd=None):
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=cwd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as error:
+        raise GipError("git is not installed") from error
+
+    if result.returncode != 0:
+        return None
+    output = result.stdout[:-1] if result.stdout.endswith(b"\n") else result.stdout
+    return Path(os.fsdecode(output))
+
+
+def parse_git_paths(output):
+    for raw_path in output.split(b"\0"):
+        if not raw_path:
+            continue
+        path = Path(os.fsdecode(raw_path))
+        if path.is_absolute() or ".." in path.parts:
+            raise GipError(f"git returned an unsafe path: {path}")
+        yield path
 
 
 def git_visible_paths(root):
@@ -47,13 +70,69 @@ def git_visible_paths(root):
         "--exclude-standard",
         "--deduplicate",
     )
-    for raw_path in output.split(b"\0"):
-        if not raw_path:
+    yield from parse_git_paths(output)
+
+
+def gitlink_paths(root):
+    output = git_output("-C", root, "ls-files", "-z", "--stage")
+    links = set()
+    for entry in output.split(b"\0"):
+        if not entry:
             continue
-        path = Path(os.fsdecode(raw_path))
-        if path.is_absolute() or ".." in path.parts:
-            raise GipError(f"git returned an unsafe path: {path}")
-        yield path
+        metadata, separator, raw_path = entry.partition(b"\t")
+        if not separator:
+            continue
+        mode = metadata.split(b" ", 1)[0]
+        if mode == b"160000":
+            path = Path(os.fsdecode(raw_path))
+            if path.is_absolute() or ".." in path.parts:
+                raise GipError(f"git returned an unsafe path: {path}")
+            links.add(path)
+    return links
+
+
+def unmanaged_visible_paths(root):
+    with tempfile.TemporaryDirectory(prefix="gip-git-") as git_dir:
+        git_output("init", "--bare", "-q", git_dir)
+        output = git_output(
+            f"--git-dir={git_dir}",
+            f"--work-tree={root}",
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+        )
+        yield from parse_git_paths(output)
+
+
+def is_repository_root(path):
+    root = find_repository_root(path)
+    if root is None:
+        return False
+    try:
+        return root.resolve() == path.resolve()
+    except OSError:
+        return False
+
+
+def visible_paths_recursive(root, repository):
+    paths = git_visible_paths(root) if repository else unmanaged_visible_paths(root)
+    gitlinks = gitlink_paths(root) if repository else set()
+
+    for relative in paths:
+        path = root / relative
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            yield relative
+            continue
+
+        if stat.S_ISDIR(mode) and relative not in gitlinks and is_repository_root(path):
+            for child in visible_paths_recursive(path, repository=True):
+                yield relative / child
+            continue
+
+        yield relative
 
 
 def add_symlink(archive, path, archive_name, mode):
@@ -77,12 +156,12 @@ def has_symlink_parent(root, relative):
     return False
 
 
-def create_archive(root, output):
+def create_archive(root, output, repository=True):
     output = Path(os.path.abspath(output))
     if not output.parent.is_dir():
         raise GipError(f"output directory does not exist: {output.parent}")
     output_location = output.parent.resolve() / output.name
-    paths = list(git_visible_paths(root))
+    paths = list(visible_paths_recursive(root, repository))
 
     fd, temporary_name = tempfile.mkstemp(
         dir=output.parent, prefix=f".{output.name}.", suffix=".tmp"
@@ -116,7 +195,6 @@ def create_archive(root, output):
                 elif stat.S_ISREG(mode):
                     archive.write(path, archive_name)
                 elif stat.S_ISDIR(mode):
-                    # ponytail: gitlinks stay boundaries; recurse if submodule contents are needed.
                     continue
                 else:
                     raise GipError(f"unsupported file type: {relative}")
@@ -132,15 +210,21 @@ def create_archive(root, output):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="ZIP tracked and non-ignored untracked files from the current Git repository."
+        description="ZIP files from the current tree, respecting Git ignore rules."
     )
-    parser.add_argument("output", nargs="?", type=Path, help="output path (default: <repo>.zip)")
+    parser.add_argument("output", nargs="?", type=Path, help="output path (default: <root>.zip)")
     args = parser.parse_args(argv)
 
     try:
-        root = repository_root()
+        repository = find_repository_root()
+        if repository is None:
+            root = Path.cwd()
+            is_repository = False
+        else:
+            root = repository
+            is_repository = True
         output = args.output or Path.cwd() / f"{root.name}.zip"
-        count = create_archive(root, output)
+        count = create_archive(root, output, repository=is_repository)
     except (GipError, OSError, zipfile.BadZipFile) as error:
         print(f"gip: {error}", file=sys.stderr)
         return 1

@@ -1,6 +1,6 @@
 # gip
 
-Git が「見える」と判断する作業ツリーだけを ZIP にする、小さな CLI です。
+Git が「見える」と判断する作業ツリーを ZIP にする、小さな CLI です。
 
 ```sh
 install -m 755 gip ~/.local/bin/gip
@@ -9,16 +9,30 @@ gip                 # カレントディレクトリに <repo>.zip
 gip /tmp/source.zip # 出力先を指定
 ```
 
-`gip` はリポジトリのルートを検出し、次の集合を現在の内容で格納します。
+`gip` は実行位置に応じて対象ルートを決めます。
+
+- Git repository 内なら、その repository root
+- Git repository 外なら、カレントディレクトリそのもの
+
+Git repository 内では、次の集合を現在の内容で格納します。
 
 - tracked files（変更済みを含む）
 - untracked かつ Git に ignore されていない files
 
 各階層の `.gitignore`、`.git/info/exclude`、global excludes は Git 自身の
 `git ls-files --cached --others --exclude-standard` に任せます。`.git`、削除済み
-tracked files、空ディレクトリ、出力 ZIP 自身、submodule の中身は入りません。
+tracked files、空ディレクトリ、出力 ZIP 自身は入りません。
 symlink は追跡せず、リンクとして格納します。
 リポジトリ外へ解決される親 symlink の先は辿りません。
+
+Git repository 外で実行した場合も、作業ツリー直下に `.git` は不要です。
+一時的な Git metadata をシステムの一時ディレクトリに作り、対象ツリー内の
+各階層の `.gitignore` と global excludes を Git 自身に解釈させます。
+配下に Git repository がある場合はその repository を検出し、そこで改めて
+tracked files、`.gitignore`、`.git/info/exclude`、global excludes を使って
+再帰的に列挙します。未追跡の nested repository も同様に再帰します。
+
+tracked submodule（gitlink）は従来どおり境界として扱い、中身は含めません。
 
 ### 対応する ignore の範囲
 
@@ -49,8 +63,3 @@ python3 -m unittest -v
 2026-08-30 時点で類似品はありますが、Git の ignore 判定をそのまま使って
 `tracked + untracked non-ignored` の作業ツリーを、追加除外・内容変換なしで
 安全に ZIP 化する小さな汎用 CLI は見当たりませんでした。
-
-## 制限
-
-submodule は境界として扱い、中身を再帰しません。必要になった時点で各
-submodule に同じ Git 列挙を再帰適用するのが拡張点です。
